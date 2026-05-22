@@ -1,0 +1,1363 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const { PrismaClient } = require('@prisma/client');
+const { PrismaLibSql } = require('@prisma/adapter-libsql');
+// Inicializamos Stripe de manera segura (si no hay key temporalmente, usamos un string vacío para no crashear Node)
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY || 'sk_test_mock_temporary_key_hoteltriz');
+
+const path = require('path');
+const fs = require('fs');
+
+// Configuración de Prisma 7 con LibSQL para SQLite local
+const dbPath = process.env.DATABASE_URL || `file:${path.join(__dirname, '../prisma/dev.db')}`;
+const adapter = new PrismaLibSql({
+  url: dbPath,
+});
+const prisma = new PrismaClient({ adapter });
+
+const app = express();
+const PORT = process.env.PORT || 3002;
+
+// Crear carpeta de uploads si no existe
+const uploadsDir = path.join(__dirname, '../uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir);
+}
+
+app.use(cors());
+app.use('/uploads', express.static(uploadsDir));
+
+// --- RUTA DE WEBHOOK (DEBE IR ANTES DE express.json()) ---
+// Stripe requiere el cuerpo del mensaje "en bruto" (raw) para verificar la firma.
+app.post('/api/webhooks/stripe', express.raw({type: 'application/json'}), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+  } catch (err) {
+    console.error(`❌ Error de firma en Webhook: ${err.message}`);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Manejar el evento de pago completado
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const bookingId = session.metadata.bookingId;
+
+    console.log(`💰 Pago confirmado para reserva: ${bookingId}`);
+
+    try {
+      await prisma.booking.update({
+        where: { id: bookingId },
+        data: { status: 'CONFIRMED' }
+      });
+      console.log('✅ Reserva marcada como CONFIRMED en la base de datos.');
+    } catch (dbError) {
+      console.error('❌ Error al actualizar la base de datos en webhook:', dbError);
+    }
+  }
+
+  res.json({ received: true });
+});
+
+// Middleware estándar para el resto de rutas
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// Logger de Tráfico (DEPURACIÓN MASTER)
+app.use((req, res, next) => {
+  if (req.url.startsWith('/api/admin/bookings')) {
+    console.log(`📡 [ADMIN_PROBE] ${req.method} ${req.url}`);
+  } else {
+    console.log(`📡 [TRAFFIC] ${req.method} ${req.url}`);
+  }
+  next();
+});
+
+// ==========================================
+// RUTAS ADMINISTRATIVAS DE ALTA PRIORIDAD
+// ==========================================
+
+// Atrapa-Todo para Diagnóstico
+app.use('/api/admin/bookings/:id', (req, res, next) => {
+  console.log(`🔍 [PROBE] Petición detectada para reserva ${req.params.id} -> Procediendo a buscar ruta...`);
+  next();
+});
+
+// Motivos de Cancelación (ALTA PRIORIDAD)
+app.get('/api/admin/cancellation-reasons', async (req, res) => {
+  try {
+    const reasons = await prisma.cancellationReason.findMany();
+    res.json(reasons);
+  } catch (error) {
+    console.warn('⚠️ [BACKEND] DB Error en motivos. Sirviendo motivos de emergencia.');
+    // Motivos de emergencia para que la UI nunca esté vacía
+    res.json([
+      { id: 'err_reserva', name: 'Error en la reserva' },
+      { id: 'cambio_planes', name: 'Cambio de planes' },
+      { id: 'no_show', name: 'No se presentó (No-Show)' },
+      { id: 'otro', name: 'Otro motivo' }
+    ]);
+  }
+});
+
+// Cobrar y Confirmar Reserva Manual
+app.patch('/api/admin/bookings/:id/status', async (req, res) => {
+  const { id } = req.params;
+  const updateData = { ...req.body };
+  try {
+    const updated = await prisma.booking.update({
+      where: { id },
+      data: updateData
+    });
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al cambiar estatus' });
+  }
+});
+
+// Modificar Reserva (Drag & Drop o Manual)
+app.patch('/api/admin/bookings/:id/update-pos', async (req, res) => {
+  const { id } = req.params;
+  const { roomId, checkIn, checkOut } = req.body;
+  
+  console.log(`[DEBUG] Petición PATCH recibida para ID: ${id}`);
+  console.log(`[DEBUG] Datos:`, req.body);
+
+  try {
+    const cIn = new Date(checkIn);
+    const cOut = new Date(checkOut);
+
+    // 1. Verificar colisiones (excluyendo la propia reserva)
+    const conflicts = await prisma.booking.findMany({
+      where: {
+        roomId,
+        id: { not: id },
+        status: { not: 'CANCELLED' },
+        AND: [
+          { checkIn: { lt: cOut } },
+          { checkOut: { gt: cIn } }
+        ]
+      }
+    });
+
+    if (conflicts.length > 0) {
+      return res.status(409).json({ error: 'Choque de fechas: Este espacio ya está ocupado.' });
+    }
+
+    // 2. Calcular diferencia de precio (basado en precio base del RoomType)
+    const currentBooking = await prisma.booking.findUnique({ 
+      where: { id },
+      include: { room: { include: { roomType: true } } }
+    });
+    
+    if (!currentBooking) {
+      return res.status(404).json({ error: 'Reserva no encontrada' });
+    }
+
+    const targetRoom = await prisma.room.findUnique({
+      where: { id: roomId },
+      include: { roomType: true }
+    });
+
+    if (!targetRoom) {
+      return res.status(404).json({ error: 'Habitación de destino no encontrada' });
+    }
+
+    // Asegurar que tenemos precio base
+    const basePrice = targetRoom.roomType?.basePrice || 0;
+    const days = Math.ceil((cOut - cIn) / (1000 * 60 * 60 * 24));
+    if (days <= 0) {
+      return res.status(400).json({ error: 'Las fechas seleccionadas no son válidas' });
+    }
+
+    const newTotal = basePrice * days;
+    const priceDiff = newTotal - currentBooking.totalPrice;
+
+    // 3. Ejecutar actualización
+    const updated = await prisma.booking.update({
+      where: { id },
+      data: { 
+        roomId, 
+        checkIn: cIn, 
+        checkOut: cOut,
+        totalPrice: newTotal
+      }
+    });
+
+    res.json({ 
+      message: 'Reserva movida con éxito', 
+      booking: updated,
+      priceDiff 
+    });
+  } catch (error) {
+    console.error('Update Booking Error:', error);
+    res.status(400).json({ error: error.message || 'Error al procesar el cambio en la reserva' });
+  }
+});
+
+// Cancelar con Motivo
+app.post('/api/admin/bookings/:id/cancel', async (req, res) => {
+  const { id } = req.params;
+  const { reasonId, details } = req.body;
+  
+  try {
+    const updated = await prisma.booking.update({
+      where: { id },
+      data: { 
+        status: 'CANCELLED',
+        cancellationReasonId: reasonId,
+        cancellationDetails: details
+      }
+    });
+    res.json({ message: 'Reserva cancelada correctamente', booking: updated });
+  } catch (error) {
+    res.status(500).json({ error: 'Error al cancelar reserva' });
+  }
+});
+
+// Simulador de Agencias Externas (Booking/Airbnb)
+app.post('/api/admin/simulate-external-booking', async (req, res) => {
+  const { guestName, checkIn, checkOut, roomId, source } = req.body;
+  
+  try {
+    const booking = await prisma.booking.create({
+      data: {
+        guestName,
+        guestEmail: `sync-${Math.floor(Math.random() * 1000)}@${source.toLowerCase()}-tester.com`,
+        checkIn: new Date(checkIn),
+        checkOut: new Date(checkOut),
+        status: 'CONFIRMED',
+        totalPrice: 0, // En iCal/Simulación no siempre viene el precio
+        source,
+        externalId: `${source.substring(0,2).toUpperCase()}-${Math.floor(Math.random() * 899999 + 100000)}`,
+        roomId
+      }
+    });
+    res.json({ message: `Reserva de ${source} simulada con éxito`, booking });
+  } catch (error) {
+    console.error('Simulation Error:', error);
+    res.status(500).json({ error: 'Fallo al simular reserva externa' });
+  }
+});
+
+// === GESTIÓN DE BLOQUEOS DE MANTENIMIENTO (PROFESIONAL) ===
+
+// Listar bloqueos
+app.get('/api/admin/maintenance-blocks', async (req, res) => {
+  try {
+    const blocks = await prisma.maintenanceBlock.findMany({
+      include: { room: { include: { roomType: true } } },
+      orderBy: { startDate: 'asc' }
+    });
+    res.json(blocks);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al obtener bloqueos' });
+  }
+});
+
+// Crear bloqueo
+app.post('/api/admin/maintenance-blocks', async (req, res) => {
+  const { roomId, startDate, endDate, reason } = req.body;
+  
+  try {
+    const sDate = new Date(startDate);
+    const eDate = new Date(endDate);
+    
+    // Validar fechas
+    if (sDate >= eDate) {
+      return res.status(400).json({ error: 'La fecha de inicio debe ser anterior a la de fin.' });
+    }
+
+    // Verificar colisiones con reservas existentes
+    const overlapBooking = await prisma.booking.findFirst({
+      where: {
+        roomId,
+        status: { not: 'CANCELLED' },
+        AND: [
+          { checkIn: { lt: eDate } },
+          { checkOut: { gt: sDate } }
+        ]
+      }
+    });
+
+    if (overlapBooking) {
+      return res.status(409).json({ error: 'Hay una reserva activa en esas fechas. Debe moverla antes de bloquear.' });
+    }
+
+    const block = await prisma.maintenanceBlock.create({
+      data: {
+        roomId,
+        startDate: sDate,
+        endDate: eDate,
+        reason
+      }
+    });
+    res.json(block);
+  } catch (error) {
+    console.error('Error creating block:', error);
+    res.status(500).json({ error: 'Error al crear bloqueo técnico' });
+  }
+});
+
+// Actualizar bloqueo
+app.patch('/api/admin/maintenance-blocks/:id', async (req, res) => {
+  const { id } = req.params;
+  const { startDate, endDate, reason } = req.body;
+  
+  try {
+    const sDate = startDate ? new Date(startDate) : undefined;
+    const eDate = endDate ? new Date(endDate) : undefined;
+
+    // Validar si las fechas son válidas si se proporcionaron
+    if ((startDate && isNaN(sDate.getTime())) || (endDate && isNaN(eDate.getTime()))) {
+      return res.status(400).json({ error: 'Formato de fecha inválido.' });
+    }
+
+    // Si se cambian fechas, verificar colisiones
+    if (sDate || eDate) {
+      const current = await prisma.maintenanceBlock.findUnique({ where: { id } });
+      if (!current) return res.status(404).json({ error: 'Bloqueo no encontrado.' });
+
+      const finalS = (startDate && !isNaN(sDate.getTime())) ? sDate : current.startDate;
+      const finalE = (endDate && !isNaN(eDate.getTime())) ? eDate : current.endDate;
+
+      // Validar orden de fechas
+      if (finalS >= finalE) {
+        return res.status(400).json({ error: 'La fecha de inicio debe ser anterior a la de fin.' });
+      }
+
+      const overlapBooking = await prisma.booking.findFirst({
+        where: {
+          roomId: current.roomId,
+          status: { not: 'CANCELLED' },
+          AND: [
+            { checkIn: { lt: finalE } },
+            { checkOut: { gt: finalS } }
+          ]
+        }
+      });
+
+      if (overlapBooking) {
+        return res.status(409).json({ error: 'Las nuevas fechas colisionan con una reserva existente.' });
+      }
+    }
+
+    const block = await prisma.maintenanceBlock.update({
+      where: { id },
+      data: {
+        startDate: sDate,
+        endDate: eDate,
+        reason
+      }
+    });
+    res.json(block);
+  } catch (error) {
+    console.error('SERVER PATCH ERROR:', error);
+    res.status(500).json({ 
+      error: 'Error interno al actualizar el bloqueo técnico',
+      details: error.message 
+    });
+  }
+});
+
+// Eliminar bloqueo
+app.delete('/api/admin/maintenance-blocks/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await prisma.maintenanceBlock.delete({ where: { id } });
+    res.json({ message: 'Bloqueo eliminado' });
+  } catch (error) {
+    res.status(500).json({ error: 'Error al eliminar bloqueo' });
+  }
+});
+
+// ==========================================
+// FIN RUTAS ADMINISTRATIVAS
+// ==========================================
+
+// Ruta de salud
+app.get('/api/health', (req, res) => {
+  res.json({ message: 'HotelTriz API is running smoothly (Prisma 7 + SQLite)' });
+});
+
+// Ruta para obtener disponibilidad filtrada
+app.post('/api/availability', async (req, res) => {
+  const { checkIn, checkOut, guests } = req.body;
+
+  if (!checkIn || !checkOut) {
+    return res.status(400).json({ error: 'Check-in and Check-out dates are required' });
+  }
+
+  try {
+    // 1. Obtener tipos de habitaciones que cumplen con la capacidad
+    const roomTypes = await prisma.roomType.findMany({
+      where: {
+        capacity: { gte: parseInt(guests) || 1 }
+      },
+      include: {
+        rooms: {
+          where: { status: 'AVAILABLE' }, // Solo habitaciones operativas (Modo global)
+          include: {
+            bookings: {
+              where: {
+                status: { not: 'CANCELLED' },
+                OR: [
+                  {
+                    AND: [
+                      { checkIn: { lt: new Date(checkOut) } },
+                      { checkOut: { gt: new Date(checkIn) } }
+                    ]
+                  }
+                ]
+              }
+            },
+            maintenanceBlocks: {
+              where: {
+                OR: [
+                  {
+                    AND: [
+                      { startDate: { lt: new Date(checkOut) } },
+                      { endDate: { gt: new Date(checkIn) } }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    });
+
+    // 2. Filtrar tipos que tengan al menos una habitación libre (sin colisiones de NINGÚN tipo)
+    const availableRoomTypes = roomTypes.filter(type => {
+      const hasFreeRoom = type.rooms.some(room => 
+        room.bookings.length === 0 && room.maintenanceBlocks.length === 0
+      );
+      return hasFreeRoom;
+    });
+
+    res.json(availableRoomTypes);
+  } catch (error) {
+    console.error('Availability Error:', error);
+    res.status(500).json({ error: 'Error al verificar disponibilidad' });
+  }
+});
+
+// Obtener motivos de cancelación
+
+// Obtener servicios extra
+app.get('/api/extra-services', async (req, res) => {
+  try {
+    const services = await prisma.extraService.findMany();
+    res.json(services);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al obtener servicios extra' });
+  }
+});
+
+// Crear una reserva pública (Sin pasarela de pago por ahora)
+app.post('/api/bookings', async (req, res) => {
+  const { guestName, guestEmail, checkIn, checkOut, roomId, extraServices, totalPrice } = req.body;
+
+  try {
+    // 1. Crear reserva en la BD con estado PENDING (Pago en efectivo en recepción)
+    const booking = await prisma.booking.create({
+      data: {
+        guestName,
+        guestEmail,
+        checkIn: new Date(checkIn),
+        checkOut: new Date(checkOut),
+        totalPrice,
+        status: 'PENDING',
+        source: 'LOCAL',
+        room: { connect: { id: roomId } },
+        extraServices: {
+          connect: (extraServices || []).map(id => ({ id }))
+        }
+      }
+    });
+    // 2. Obtener detalles básicos del hotel y habitación para Stripe
+    const room = await prisma.room.findUnique({
+      where: { id: roomId },
+      include: { roomType: true }
+    });
+
+    const clientUrl = req.headers.origin || process.env.CLIENT_URL || 'http://localhost:3030';
+
+    // 3. Crear Sesión de Stripe
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: `Reserva: ${room.roomType.name}`,
+              description: `Huésped: ${guestName} | ${checkIn} al ${checkOut}`,
+            },
+            unit_amount: Math.round(totalPrice * 100), // Stripe usa centavos
+          },
+          quantity: 1,
+        },
+      ],
+      mode: 'payment',
+      customer_email: guestEmail,
+      metadata: {
+        bookingId: booking.id
+      },
+      success_url: `${clientUrl.replace(/\/$/, '')}/?session_id={CHECKOUT_SESSION_ID}&booking_id=${booking.id}`,
+      cancel_url: `${clientUrl.replace(/\/$/, '')}/?payment_cancelled=true`,
+    });
+
+    // 4. Guardar ID de sesión en la reserva
+    await prisma.booking.update({
+      where: { id: booking.id },
+      data: { stripeSessionId: session.id }
+    });
+
+    // Enviamos la URL de redirección al cliente
+    res.json({ 
+      message: 'Checkout iniciado', 
+      url: session.url,
+      booking 
+    });
+  } catch (error) {
+    console.error('Booking Error:', error);
+    res.status(500).json({ error: 'Error al procesar reserva o pago' });
+  }
+});
+
+// Endpoint de confirmación (Desactivado temporalmente - uso futuro para Stripe Webhooks)
+app.post('/api/payments/confirm', async (req, res) => {
+  const { session_id, booking_id } = req.body;
+  console.log(`🔍 Intentando confirmar pago manualmente: Session=${session_id}, Booking=${booking_id}`);
+  
+  try {
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    if (session.payment_status === 'paid') {
+      const updated = await prisma.booking.update({
+        where: { id: booking_id },
+        data: { status: 'CONFIRMED' }
+      });
+      return res.json({ success: true, booking: updated });
+    }
+    res.status(400).json({ success: false, error: 'El pago no ha sido completado' });
+  } catch (error) {
+    console.error('Stripe Confirm Error:', error);
+    res.status(500).json({ error: 'Error validando estado en Stripe' });
+  }
+});
+
+// === ENDPOINTS ADMINISTRATIVOS (FASE 3 & SEGURIDAD) ===
+
+// Login Administrativo MVP
+app.post('/api/admin/login', (req, res) => {
+  const { password } = req.body;
+  const adminPassword = process.env.ADMIN_PASSWORD || 'paraiso2026';
+  
+  if (password === adminPassword) {
+    // Para la etapa actual antes de Supabase, validamos con un token simple estático
+    res.json({ token: 'admin_authorized_token_hoteltriz_v1' });
+  } else {
+    res.status(401).json({ error: 'Contraseña incorrecta' });
+  }
+});
+
+// Obtener estadísticas para el dashboard
+app.get('/api/admin/stats', async (req, res) => {
+  try {
+    const totalBookings = await prisma.booking.count();
+    const roomsCount = await prisma.room.count();
+    const totalRevenue = await prisma.booking.aggregate({
+      _sum: { totalPrice: true }
+    });
+    
+    // Ocupación hoy (simulado: hoy hay reservas activas)
+    const today = new Date();
+    today.setHours(0,0,0,0);
+    const occupiedRooms = await prisma.booking.count({
+      where: {
+        checkIn: { lte: today },
+        checkOut: { gte: today },
+        status: { not: 'CANCELLED' }
+      }
+    });
+
+    res.json({
+      totalBookings,
+      totalRevenue: totalRevenue._sum.totalPrice || 0,
+      occupancyRate: roomsCount > 0 ? (occupiedRooms / roomsCount) * 100 : 0,
+      occupiedRooms,
+      totalRooms: roomsCount
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Error al obtener estadísticas' });
+  }
+});
+
+// Lista completa de reservas (Staff)
+app.get('/api/admin/bookings', async (req, res) => {
+  try {
+    const bookings = await prisma.booking.findMany({
+      include: {
+        room: { include: { roomType: true } },
+        extraServices: true,
+        order: {
+          include: {
+            items: {
+              include: { dish: true }
+            }
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    res.json(bookings);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al obtener reservas admin' });
+  }
+});
+
+// Gestión de estado general de la habitación
+app.patch('/api/admin/rooms/:id', async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body; 
+
+  try {
+    const updatedRoom = await prisma.room.update({
+      where: { id },
+      data: { status }
+    });
+    res.json(updatedRoom);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al actualizar habitación' });
+  }
+});
+
+// Cambiar estado de limpieza (Housekeeping)
+app.patch('/api/admin/rooms/:id/housekeeping', async (req, res) => {
+  const { id } = req.params;
+  const { housekeepingStatus } = req.body;
+
+  try {
+    const updated = await prisma.room.update({
+      where: { id },
+      data: { housekeepingStatus }
+    });
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al actualizar limpieza' });
+  }
+});
+
+// Obtener Tareas de Limpieza Diarias (Housekeeping)
+app.get('/api/admin/housekeeping', async (req, res) => {
+  try {
+    const today = new Date();
+    today.setHours(0,0,0,0);
+    const endOfDay = new Date(today);
+    endOfDay.setHours(23,59,59,999);
+
+    const rooms = await prisma.room.findMany({
+      include: {
+        roomType: true,
+        // Traer reservas con movimiento HOY (Entradas o Salidas)
+        bookings: {
+          where: {
+            OR: [
+              { checkOut: { gte: today, lte: endOfDay } },
+              { checkIn: { gte: today, lte: endOfDay } }
+            ],
+            status: { not: 'CANCELLED' }
+          }
+        }
+      }
+    });
+    res.json(rooms);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al obtener tareas de limpieza' });
+  }
+});
+
+// Marcar habitación limpia/sucia
+app.patch('/api/admin/rooms/:id/housekeeping', async (req, res) => {
+  const { id } = req.params;
+  const { housekeepingStatus } = req.body;
+  try {
+    const updated = await prisma.room.update({
+      where: { id },
+      data: { housekeepingStatus }
+    });
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ error: 'Error actualizando limpieza' });
+  }
+});
+
+
+// === Módulo de Reservas Físicas (Recepción) ===
+app.post('/api/admin/bookings/new', async (req, res) => {
+  const { guestName, checkIn, checkOut, roomId, totalPrice, force } = req.body;
+  
+  if (!checkIn || !checkOut || !roomId) {
+    return res.status(400).json({ error: 'Faltan datos obligatorios' });
+  }
+
+  try {
+    const cIn = new Date(checkIn);
+    const cOut = new Date(checkOut);
+    
+    // 1. Verificación Local: Comprobar colisión estricta en la Base de Datos para esta habitación específica
+    const localConflicts = await prisma.booking.findMany({
+      where: {
+        roomId,
+        status: { not: 'CANCELLED' },
+        AND: [
+          { checkIn: { lt: cOut } },
+          { checkOut: { gt: cIn } }
+        ]
+      }
+    });
+
+    if (localConflicts.length > 0 && !force) {
+      return res.status(409).json({ 
+        error: 'CONFLICTO LOCAL: Esta habitación ya está ocupada en esas fechas en tu sistema interno. ¿Deseas sobreescribir y forzar la reserva?',
+        conflictType: 'LOCAL'
+      });
+    }
+
+    // 2. Verificación Externa (Pre-Flight iCal)
+    if (!force) {
+      const hotel = await prisma.hotel.findFirst();
+      if (hotel) {
+        const urls = [hotel.airbnbIcalUrl, hotel.bookingIcalUrl].filter(Boolean);
+        for (const url of urls) {
+          try {
+            const data = await new Promise((resolve, reject) => {
+              https.get(url, (resp) => { let str = ''; resp.on('data', chunk => str += chunk); resp.on('end', () => resolve(str)); }).on('error', reject);
+            });
+            const events = parseIcal(data);
+            
+            // Comprobar si hay un evento externo que coincida con las fechas (Aviso general de OTA)
+            const hasOtaConflict = events.some(event => {
+              const eIn = icalToDate(event.start);
+              const eOut = icalToDate(event.end);
+              return eIn < cOut && eOut > cIn;
+            });
+            
+            if (hasOtaConflict) {
+              return res.status(409).json({ 
+                error: 'ALERTA AGENCIAS: Se ha detectado una reserva en Booking.com / Airbnb que choca con estas fechas. ¿Forzar inserción de todas formas?',
+                conflictType: 'OTA'
+              });
+            }
+          } catch (e) {
+            console.error('Error pre-flight iCal:', e);
+            // Si falla la OTA, seguimos silenciosamente (por ser caché) o podríamos alertar.
+          }
+        }
+      }
+    }
+
+    // 3. Inserción Directa
+    const booking = await prisma.booking.create({
+      data: {
+        guestName: guestName || 'Walk-in Guest',
+        guestEmail: 'recepcion@hoteltriz.com',
+        checkIn: cIn,
+        checkOut: cOut,
+        totalPrice: parseFloat(totalPrice) || 0,
+        status: 'PENDING', // Cobro en mostrador pendiente
+        source: 'LOCAL',
+        roomId
+      }
+    });
+
+    res.json({ message: 'Reserva administrativa creada', booking });
+  } catch (error) {
+    console.error('Error Admin Booking:', error);
+    res.status(500).json({ error: 'Error del servidor al crear reserva' });
+  }
+});
+
+// (Rutas movidas al inicio para prioridad)
+
+// === FASE 4: SINCRONIZACIÓN ICAL (PUENTE) ===
+
+const https = require('https');
+
+// Parser nativo ligero para iCal
+function parseIcal(data) {
+  const events = [];
+  let currentEvent = null;
+  const lines = data.split(/\r?\n/);
+
+  for (let line of lines) {
+    if (line.startsWith('BEGIN:VEVENT')) {
+      currentEvent = {};
+    } else if (line.startsWith('END:VEVENT')) {
+      if (currentEvent.start && currentEvent.end) events.push(currentEvent);
+      currentEvent = null;
+    } else if (currentEvent) {
+      if (line.startsWith('DTSTART')) currentEvent.start = line.split(':')[1];
+      if (line.startsWith('DTEND')) currentEvent.end = line.split(':')[1];
+      if (line.startsWith('UID')) currentEvent.uid = line.split(':')[1];
+      if (line.startsWith('SUMMARY')) currentEvent.summary = line.split(':')[1];
+    }
+  }
+  return events;
+}
+
+// Convertir formato iCal (YYYYMMDD) a Date
+function icalToDate(icalStr) {
+  if (!icalStr) return null;
+  const year = icalStr.substring(0, 4);
+  const month = icalStr.substring(4, 6);
+  const day = icalStr.substring(6, 8);
+  return new Date(`${year}-${month}-${day}T12:00:00Z`);
+}
+
+// Guardar URLs de sincronización (Admin)
+app.post('/api/admin/sync/settings', async (req, res) => {
+  const { airbnbIcalUrl, bookingIcalUrl } = req.body;
+  try {
+    const hotel = await prisma.hotel.findFirst();
+    if (hotel) {
+      const updated = await prisma.hotel.update({
+        where: { id: hotel.id },
+        data: { airbnbIcalUrl, bookingIcalUrl }
+      });
+      res.json(updated);
+    } else {
+      res.status(404).json({ error: 'Hotel no encontrado' });
+    }
+  } catch (error) {
+    res.status(500).json({ error: 'Error al guardar configuración iCal' });
+  }
+});
+
+// Ruta Pública para Exportar Calendario de HotelTriz
+app.get('/api/public/calendar/:hotelId.ics', async (req, res) => {
+  const { hotelId } = req.params;
+  try {
+    const bookings = await prisma.booking.findMany({
+      where: { room: { roomType: { hotelId } }, status: 'CONFIRMED' }
+    });
+
+    let icsContent = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//HotelTriz//NONSGML v1.0//EN\n";
+    bookings.forEach(b => {
+      icsContent += "BEGIN:VEVENT\n";
+      icsContent += `DTSTART:${b.checkIn.toISOString().replace(/[-:]/g, '').split('.')[0]}Z\n`;
+      icsContent += `DTEND:${b.checkOut.toISOString().replace(/[-:]/g, '').split('.')[0]}Z\n`;
+      icsContent += `SUMMARY:Reserva HotelTriz - ${b.guestName}\n`;
+      icsContent += `UID:${b.id}@hoteltriz.com\n`;
+      icsContent += "END:VEVENT\n";
+    });
+    icsContent += "END:VCALENDAR";
+
+    res.setHeader('Content-Type', 'text/calendar');
+    res.setHeader('Content-Disposition', `attachment; filename="hotel_${hotelId}.ics"`);
+    res.send(icsContent);
+  } catch (error) {
+    res.status(500).send('Error generating calendar');
+  }
+});
+
+// Disparar sincronización manual (Admin)
+app.post('/api/admin/sync/trigger', async (req, res) => {
+  const hotel = await prisma.hotel.findFirst(); // En esta versión manejamos un solo hotel por instancia
+  if (!hotel || (!hotel.airbnbIcalUrl && !hotel.bookingIcalUrl)) {
+    return res.status(400).json({ error: 'No hay URLs de sincronización configuradas.' });
+  }
+
+  const syncResults = [];
+
+  const sources = [
+    { name: 'AIRBNB', url: hotel.airbnbIcalUrl },
+    { name: 'BOOKING', url: hotel.bookingIcalUrl }
+  ].filter(s => s.url);
+
+  for (const source of sources) {
+    try {
+      const data = await new Promise((resolve, reject) => {
+        https.get(source.url, (resp) => {
+          let str = '';
+          resp.on('data', (chunk) => str += chunk);
+          resp.on('end', () => resolve(str));
+        }).on('error', reject);
+      });
+
+      const externalEvents = parseIcal(data);
+      let newBlocks = 0;
+
+      for (const event of externalEvents) {
+        const checkIn = icalToDate(event.start);
+        const checkOut = icalToDate(event.end);
+        
+        // Evitar duplicados usando externalId
+        const existing = await prisma.booking.findFirst({
+          where: { externalId: event.uid }
+        });
+
+        if (!existing && checkIn && checkOut) {
+          // Bloquear la primera habitación disponible
+          const firstRoom = await prisma.room.findFirst(); 
+          if (firstRoom) {
+            await prisma.booking.create({
+              data: {
+                guestName: event.summary || `Reserva ${source.name}`,
+                guestEmail: 'sync@hoteltriz.com',
+                checkIn,
+                checkOut,
+                status: 'CONFIRMED',
+                totalPrice: 0,
+                source: source.name,
+                externalId: event.uid,
+                roomId: firstRoom.id
+              }
+            });
+            newBlocks++;
+          }
+        }
+      }
+      syncResults.push({ source: source.name, newBlocks });
+    } catch (err) {
+      console.error(`Error syncing ${source.name}:`, err);
+      syncResults.push({ source: source.name, error: 'Fallo al conectar o parsear' });
+    }
+  }
+
+  res.json({ message: 'Sincronización completada', details: syncResults });
+});
+
+// ==========================================
+// KITCHEN & RESTAURANT SYSTEM (PARAISO)
+// ==========================================
+
+// Get all active orders
+app.get('/api/kitchen/orders', async (req, res) => {
+  try {
+    const orders = await prisma.order.findMany({
+      where: { status: { not: 'SERVED' } },
+      include: { 
+        restaurant: true,
+        items: { include: { dish: true } }
+      },
+      orderBy: { createdAt: 'asc' }
+    });
+    res.json(orders);
+  } catch (error) {
+    res.status(500).json({ error: 'Error fetching orders' });
+  }
+});
+
+// Create a restaurant reservation (books a "Restaurant Table" room)
+app.post('/api/kitchen/reservations', async (req, res) => {
+  const { guestName, guestEmail, date, time, people } = req.body;
+  try {
+    // Find the "Restaurant Table" room type
+    const tableType = await prisma.roomType.findFirst({ where: { name: 'Restaurant Table' } });
+    if (!tableType) return res.status(404).json({ error: 'No restaurant tables configured.' });
+
+    // Build check-in/check-out from date + time (2-hour window)
+    const checkIn = new Date(`${date}T${time}:00`);
+    const checkOut = new Date(checkIn.getTime() + 2 * 60 * 60 * 1000); // +2 hours
+
+    // Find all tables of this type
+    const allTables = await prisma.room.findMany({ where: { roomTypeId: tableType.id, status: 'AVAILABLE' } });
+
+    // Find which tables are already booked during this window
+    const conflicting = await prisma.booking.findMany({
+      where: {
+        room: { roomTypeId: tableType.id },
+        status: { notIn: ['CANCELLED'] },
+        checkIn: { lt: checkOut },
+        checkOut: { gt: checkIn },
+      },
+      select: { roomId: true }
+    });
+    const bookedIds = new Set(conflicting.map(b => b.roomId));
+    const availableTable = allTables.find(t => !bookedIds.has(t.id));
+
+    if (!availableTable) {
+      return res.status(409).json({ error: 'No tables available at the requested time. Please choose a different time.' });
+    }
+
+    // Create the booking
+    const booking = await prisma.booking.create({
+      data: {
+        guestName: guestName || `Guest (${people} pax)`,
+        guestEmail: guestEmail || '',
+        checkIn,
+        checkOut,
+        totalPrice: 0,
+        status: 'CONFIRMED',
+        roomId: availableTable.id,
+      },
+      include: { room: { include: { roomType: true } } }
+    });
+
+    // If there are pre-selected items, create an Order linked to this Booking
+    if (req.body.items && req.body.items.length > 0) {
+      let restaurant = await prisma.restaurant.findFirst();
+      if (!restaurant) {
+        const hotel = await prisma.hotel.findFirst();
+        restaurant = await prisma.restaurant.create({
+          data: { name: 'Main Restaurant', hotelId: hotel.id }
+        });
+      }
+      
+      await prisma.order.create({
+        data: {
+          guestName: booking.guestName,
+            tableNumber: availableTable.number,
+            peopleCount: parseInt(people),
+            restaurantId: restaurant.id,
+            bookingId: booking.id,
+            items: {
+              create: req.body.items.map(item => ({
+                dishId: item.dishId,
+                quantity: parseInt(item.quantity),
+                notes: item.notes || ''
+              }))
+            }
+          }
+        });
+      }
+
+    res.json(booking);
+  } catch (error) {
+    console.error("Restaurant reservation error:", error);
+    res.status(500).json({ error: 'Error creating reservation' });
+  }
+});
+
+// Create a new order
+app.post('/api/kitchen/orders', async (req, res) => {
+  const { guestName, roomNumber, tableNumber, peopleCount, restaurantId, items, bookingId } = req.body;
+  try {
+    const orderData = {
+      guestName,
+      roomNumber,
+      tableNumber,
+      peopleCount: parseInt(peopleCount),
+      restaurantId,
+      items: {
+        create: items.map(item => ({
+          dishId: item.dishId,
+          quantity: parseInt(item.quantity),
+          notes: item.notes || ''
+        }))
+      }
+    };
+    if (bookingId) orderData.bookingId = bookingId;
+    const order = await prisma.order.create({ data: orderData });
+    res.json(order);
+  } catch (error) {
+    console.error("Order creation error:", error);
+    res.status(500).json({ error: 'Error creating order' });
+  }
+});
+
+// Update order status/assignment
+app.patch('/api/kitchen/orders/:id', async (req, res) => {
+  const { id } = req.params;
+  const { status, restaurantId, tableNumber } = req.body;
+  try {
+    const updated = await prisma.order.update({
+      where: { id },
+      data: { 
+        ...(status && { status }),
+        ...(restaurantId && { restaurantId }),
+        ...(tableNumber && { tableNumber })
+      }
+    });
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ error: 'Error updating order' });
+  }
+});
+
+
+// Get dishes for a restaurant
+app.get('/api/kitchen/restaurants/:id/dishes', async (req, res) => {
+  try {
+    const dishes = await prisma.dish.findMany({
+      where: { restaurantId: req.params.id }
+    });
+    res.json(dishes);
+  } catch (error) {
+    res.status(500).json({ error: 'Error fetching dishes' });
+  }
+});
+
+// ==========================================
+// INVENTORY MANAGEMENT (CRUD)
+// ==========================================
+
+// Room Types
+app.get('/api/admin/inventory/room-types', async (req, res) => {
+  const roomTypes = await prisma.roomType.findMany({ include: { rooms: true } });
+  res.json(roomTypes);
+});
+
+app.post('/api/admin/inventory/room-types', async (req, res) => {
+  try {
+    const hotel = await prisma.hotel.findFirst();
+    if (!hotel) return res.status(404).json({ error: 'Hotel no encontrado' });
+    const rt = await prisma.roomType.create({ data: { ...req.body, hotelId: hotel.id } });
+    res.json(rt);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/inventory/room-types/:id', async (req, res) => {
+  await prisma.roomType.delete({ where: { id: req.params.id } });
+  res.json({ success: true });
+});
+
+// Image Upload (Base64 to File)
+app.post('/api/upload', async (req, res) => {
+  try {
+    const { image, name } = req.body;
+    if (!image) return res.status(400).json({ error: 'No image data provided' });
+    
+    const base64Data = image.replace(/^data:image\/\w+;base64,/, "");
+    const fileName = `${Date.now()}-${name || 'upload'}.jpg`;
+    const filePath = path.join(__dirname, '../uploads', fileName);
+    
+    fs.writeFileSync(filePath, base64Data, 'base64');
+    
+    const url = `/uploads/${fileName}`;
+    res.json({ url });
+  } catch (err) {
+    console.error('Upload error:', err);
+    res.status(500).json({ error: 'Failed to upload image' });
+  }
+});
+
+// Stations (Restaurants) Management
+app.get('/api/kitchen/restaurants', async (req, res) => {
+  try {
+    const restaurants = await prisma.restaurant.findMany({ include: { tables: true } });
+    res.json(restaurants);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/kitchen/restaurants', async (req, res) => {
+  try {
+    const hotel = await prisma.hotel.findFirst();
+    if (!hotel) return res.status(404).json({ error: 'Hotel no encontrado' });
+    const { id, createdAt, hotel: hotelData, tables, dishes, orders, ...rest } = req.body;
+    const restEntity = await prisma.restaurant.create({ 
+      data: { ...rest, hotelId: hotel.id } 
+    });
+    res.json(restEntity);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/kitchen/restaurants/:id', async (req, res) => {
+  try {
+    const { id, createdAt, hotel, tables, dishes, orders, ...rest } = req.body;
+    const restEntity = await prisma.restaurant.update({
+      where: { id: req.params.id },
+      data: { ...rest }
+    });
+    res.json(restEntity);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/kitchen/restaurants/:id', async (req, res) => {
+  try {
+    await prisma.restaurant.delete({ where: { id: req.params.id } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Tables Management
+app.post('/api/kitchen/restaurants/:id/tables', async (req, res) => {
+  try {
+    const table = await prisma.table.create({
+      data: {
+        ...req.body,
+        restaurantId: req.params.id
+      }
+    });
+    res.json(table);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/kitchen/tables/:id/position', async (req, res) => {
+  try {
+    const { positionX, positionY } = req.body;
+    const table = await prisma.table.update({
+      where: { id: req.params.id },
+      data: { 
+        positionX: parseInt(positionX) || 0, 
+        positionY: parseInt(positionY) || 0 
+      }
+    });
+    res.json(table);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/kitchen/tables/:id', async (req, res) => {
+  try {
+    const { number, capacity } = req.body;
+    const table = await prisma.table.update({
+      where: { id: req.params.id },
+      data: {
+        ...(number !== undefined && { number: String(number) }),
+        ...(capacity !== undefined && { capacity: parseInt(capacity) || 2 }),
+      }
+    });
+    res.json(table);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/kitchen/tables/:id', async (req, res) => {
+  try {
+    await prisma.table.delete({ where: { id: req.params.id } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Dishes Management
+app.get('/api/admin/inventory/dishes', async (req, res) => {
+  const dishes = await prisma.dish.findMany({ include: { restaurant: true } });
+  res.json(dishes);
+});
+
+app.post('/api/admin/inventory/dishes', async (req, res) => {
+  const { restaurantId, id, createdAt, restaurant, orderItems, ...rest } = req.body;
+  const dish = await prisma.dish.create({ 
+    data: { 
+      ...rest,
+      restaurantId: restaurantId || null
+    } 
+  });
+  res.json(dish);
+});
+
+app.patch('/api/admin/inventory/dishes/:id', async (req, res) => {
+  const { restaurantId, id, createdAt, restaurant, orderItems, ...rest } = req.body;
+  const dish = await prisma.dish.update({
+    where: { id: req.params.id },
+    data: {
+      ...rest,
+      restaurantId: restaurantId || null
+    }
+  });
+  res.json(dish);
+});
+
+app.delete('/api/admin/inventory/dishes/:id', async (req, res) => {
+  await prisma.dish.delete({ where: { id: req.params.id } });
+  res.json({ success: true });
+});
+
+// Extra Services Management
+app.get('/api/admin/inventory/extra-services', async (req, res) => {
+  const services = await prisma.extraService.findMany();
+  res.json(services);
+});
+
+app.post('/api/admin/inventory/extra-services', async (req, res) => {
+  try {
+    const hotel = await prisma.hotel.findFirst();
+    if (!hotel) return res.status(404).json({ error: 'Hotel no encontrado' });
+    const { name, description, price } = req.body;
+    const service = await prisma.extraService.create({ 
+      data: { name, description, price: parseFloat(price), hotelId: hotel.id } 
+    });
+    res.json(service);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/admin/inventory/extra-services/:id', async (req, res) => {
+  try {
+    const { name, description, price } = req.body;
+    const service = await prisma.extraService.update({
+      where: { id: req.params.id },
+      data: { name, description, price: parseFloat(price) }
+    });
+    res.json(service);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/inventory/extra-services/:id', async (req, res) => {
+  await prisma.extraService.delete({ where: { id: req.params.id } });
+  res.json({ success: true });
+});
+
+
+// Kitchen Inventory Management
+app.get('/api/admin/inventory/items', async (req, res) => {
+  const items = await prisma.inventoryItem.findMany();
+  res.json(items);
+});
+
+app.post('/api/admin/inventory/items', async (req, res) => {
+  try {
+    const hotel = await prisma.hotel.findFirst();
+    if (!hotel) return res.status(404).json({ error: 'Hotel no encontrado' });
+    const item = await prisma.inventoryItem.create({ 
+      data: { 
+        ...req.body, 
+        lowStockAlert: req.body.lowStockAlert ? parseFloat(req.body.lowStockAlert) : 5,
+        hotelId: hotel.id 
+      } 
+    });
+    res.json(item);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/admin/inventory/items/:id', async (req, res) => {
+  const item = await prisma.inventoryItem.update({
+    where: { id: req.params.id },
+    data: req.body
+  });
+  res.json(item);
+});
+
+app.delete('/api/admin/inventory/items/:id', async (req, res) => {
+  await prisma.inventoryItem.delete({ where: { id: req.params.id } });
+  res.json({ success: true });
+});
+
+// Start Server
+app.listen(PORT, '127.0.0.1', (err) => {
+  if (err) {
+    console.error(`❌ ERROR AL INICIAR SERVIDOR: ${err.message}`);
+    process.exit(1);
+  }
+  console.log(`PARAISO DE AVEDAD API RUNNING ON PORT ${PORT}`);
+});

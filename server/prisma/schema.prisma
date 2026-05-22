@@ -1,0 +1,177 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Hotel {
+  id              String   @id @default(cuid())
+  name            String
+  domain          String?
+  logoUrl         String?
+  airbnbIcalUrl   String?
+  bookingIcalUrl  String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  roomTypes       RoomType[]
+  extraServices   ExtraService[]
+  restaurants     Restaurant[]
+  inventoryItems  InventoryItem[]
+}
+
+model Restaurant {
+  id        String   @id @default(cuid())
+  name      String
+  imageUrl  String?
+  hotelId   String
+  hotel     Hotel    @relation(fields: [hotelId], references: [id])
+  tables    Table[]
+  dishes    Dish[]
+  orders    Order[]
+  createdAt DateTime @default(now())
+}
+
+model Table {
+  id           String     @id @default(cuid())
+  number       String
+  capacity     Int        @default(2)
+  positionX    Int        @default(0)
+  positionY    Int        @default(0)
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  createdAt    DateTime   @default(now())
+}
+
+model Dish {
+  id                   String      @id @default(cuid())
+  name                 String
+  description          String?
+  price                Float
+  imageUrl             String?
+  category             String      @default("FOOD") // FOOD, DRINK
+  isChefRecommendation Boolean     @default(false)
+  restaurantId         String?
+  restaurant           Restaurant? @relation(fields: [restaurantId], references: [id])
+  orderItems           OrderItem[]
+  createdAt            DateTime    @default(now())
+}
+
+model Order {
+  id           String      @id @default(cuid())
+  guestName    String?
+  roomNumber   String?
+  tableNumber  String?
+  peopleCount  Int         @default(1)
+  status       String      @default("PENDING") // PENDING, PREPARING, READY, SERVED, CANCELLED
+  restaurantId String
+  restaurant   Restaurant  @relation(fields: [restaurantId], references: [id])
+  items        OrderItem[]
+  bookingId    String?     @unique
+  booking      Booking?    @relation(fields: [bookingId], references: [id])
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+}
+
+model OrderItem {
+  id      String @id @default(cuid())
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id])
+  dishId  String
+  dish    Dish   @relation(fields: [dishId], references: [id])
+  quantity Int    @default(1)
+  notes    String?
+}
+
+model InventoryItem {
+  id              String   @id @default(cuid())
+  name            String
+  quantity        Float    @default(0)
+  unit            String   @default("units") // kg, liters, units, etc.
+  category        String   @default("FOOD") // FOOD, EQUIPMENT
+  lowStockAlert   Float    @default(5)
+  hotelId         String
+  hotel           Hotel    @relation(fields: [hotelId], references: [id])
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model RoomType {
+  id          String   @id @default(cuid())
+  name        String   @unique // e.g., Suite, Standard
+  description String?
+  basePrice   Float
+  capacity    Int
+  hotelId     String
+  hotel       Hotel    @relation(fields: [hotelId], references: [id])
+  rooms       Room[]
+}
+
+model Room {
+  id                 String   @id @default(cuid())
+  number             String   @unique
+  floor              Int?
+  status             String   @default("AVAILABLE") // AVAILABLE, MAINTENANCE
+  housekeepingStatus String   @default("CLEAN") // CLEAN, DIRTY, IN_SERVICE
+  roomTypeId         String
+  roomType           RoomType @relation(fields: [roomTypeId], references: [id])
+  bookings           Booking[]
+  maintenanceBlocks  MaintenanceBlock[]
+}
+
+model ExtraService {
+  id          String    @id @default(cuid())
+  name        String   @unique
+  description String?
+  price       Float
+  hotelId     String
+  hotel       Hotel     @relation(fields: [hotelId], references: [id])
+  bookings    Booking[] @relation("BookingToExtraService")
+  createdAt   DateTime  @default(now())
+}
+
+model Booking {
+  id                    String   @id @default(cuid())
+  guestName             String
+  guestEmail            String
+  checkIn               DateTime
+  checkOut              DateTime
+  status                String   @default("PENDING") // PENDING, CONFIRMED, CANCELLED, COMPLETED
+  totalPrice            Float
+  source                String   @default("LOCAL") // LOCAL, AIRBNB, BOOKING
+  externalId            String?  // ID de la reserva externa
+  stripeSessionId       String?  // ID de la sesión de Stripe
+  roomId                String
+  room                  Room     @relation(fields: [roomId], references: [id])
+  extraServices         ExtraService[] @relation("BookingToExtraService")
+  
+  // Gestión de Cancelación
+  cancellationReasonId  String?
+  cancellationReason    CancellationReason? @relation(fields: [cancellationReasonId], references: [id])
+  cancellationDetails   String?  // Para el detalle de "Otro motivo"
+  order                 Order?
+
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
+model CancellationReason {
+  id        String    @id @default(cuid())
+  name      String    // e.g., No Show, Error en reserva, etc.
+  bookings  Booking[]
+}
+
+model MaintenanceBlock {
+  id        String   @id @default(cuid())
+  roomId    String
+  room      Room     @relation(fields: [roomId], references: [id])
+  startDate DateTime
+  endDate   DateTime
+  reason    String?
+  createdAt DateTime @default(now())
+}
+
