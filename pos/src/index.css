@@ -1,0 +1,177 @@
+@import "tailwindcss";
+@import "@fortawesome/fontawesome-free/css/all.min.css";
+
+/* Theme Variables Definition */
+:root {
+  --bg-primary: #0b0b0b;
+  --bg-secondary: #171717;
+  --bg-tertiary: #0a0a0a;
+  --text-primary: #f5f5f5;
+  --text-secondary: #a3a3a3;
+  --text-muted: #737373;
+  --accent: #C5A059;
+  --accent-text: #000000;
+  --border-color: #262626;
+  --border-light: #1f1f1f;
+  --calc-btn: #1f1f1f;
+  --calc-btn-hover: #2d2d2d;
+  --accent-alpha: rgba(197, 160, 89, 0.1);
+  --accent-border: rgba(197, 160, 89, 0.2);
+}
+
+.theme-green {
+  --bg-primary: #f0f4f1;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #e3ebe4;
+  --text-primary: #142816;
+  --text-secondary: #3b5c3e;
+  --text-muted: #6e8e71;
+  --accent: #15803d; /* Original Green */
+  --accent-text: #ffffff;
+  --border-color: #cbdad1;
+  --border-light: #dfe6e1;
+  --calc-btn: #f0f4f1;
+  --calc-btn-hover: #d5e2d7;
+  --accent-alpha: rgba(21, 128, 61, 0.1);
+  --accent-border: rgba(21, 128, 61, 0.25);
+}
+
+.theme-plain {
+  --bg-primary: #f1f5f9;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #e2e8f0;
+  --text-primary: #0f172a; /* Slate Dark */
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+  --accent: #334155; /* Slate Minimalist */
+  --accent-text: #ffffff;
+  --border-color: #cbd5e1;
+  --border-light: #e2e8f0;
+  --calc-btn: #f8fafc;
+  --calc-btn-hover: #cbd5e1;
+  --accent-alpha: rgba(51, 65, 85, 0.08);
+  --accent-border: rgba(51, 65, 85, 0.2);
+}
+
+/* 1. Base overrides when a light theme is active */
+.theme-green, .theme-plain {
+  background-color: var(--bg-primary) !important;
+  color: var(--text-primary) !important;
+}
+
+/* 2. Containers: headers, sidebars, cards */
+.theme-green .bg-neutral-900, .theme-plain .bg-neutral-900,
+.theme-green header, .theme-plain header,
+.theme-green aside, .theme-plain aside {
+  background-color: var(--bg-secondary) !important;
+  border-color: var(--border-color) !important;
+}
+
+.theme-green .bg-neutral-950, .theme-plain .bg-neutral-950 {
+  background-color: var(--bg-tertiary) !important;
+  border-color: var(--border-color) !important;
+}
+
+/* 3. Global Borders override */
+.theme-green .border-neutral-800, .theme-plain .border-neutral-800,
+.theme-green .border-neutral-850, .theme-plain .border-neutral-850,
+.theme-green .border-l, .theme-plain .border-l,
+.theme-green .border-b, .theme-plain .border-b,
+.theme-green .border-t, .theme-plain .border-t,
+.theme-green .border, .theme-plain .border {
+  border-color: var(--border-color) !important;
+}
+
+/* 4. Text Classes override */
+.theme-green .text-neutral-400, .theme-plain .text-neutral-400 {
+  color: var(--text-secondary) !important;
+}
+
+.theme-green .text-neutral-500, .theme-plain .text-neutral-500 {
+  color: var(--text-muted) !important;
+}
+
+.theme-green .text-white, .theme-plain .text-white,
+.theme-green .text-neutral-100, .theme-plain .text-neutral-100 {
+  color: var(--text-primary) !important;
+}
+
+.theme-green .text-\[\#C5A059\], .theme-plain .text-\[\#C5A059\] {
+  color: var(--accent) !important;
+}
+
+/* 5. Accent background colors and buttons */
+.theme-green .bg-\[\#C5A059\], .theme-plain .bg-\[\#C5A059\] {
+  background-color: var(--accent) !important;
+  color: var(--accent-text) !important;
+}
+
+.theme-green .bg-\[\#C5A059\]\/10, .theme-plain .bg-\[\#C5A059\]\/10 {
+  background-color: var(--accent-alpha) !important;
+  color: var(--accent) !important;
+  border-color: var(--accent-border) !important;
+}
+
+/* 6. Calculator/Interactive button elements */
+.theme-green .bg-neutral-800, .theme-plain .bg-neutral-800,
+.theme-green .bg-neutral-850, .theme-plain .bg-neutral-850 {
+  background-color: var(--calc-btn) !important;
+  color: var(--text-primary) !important;
+  border-color: var(--border-color) !important;
+}
+
+.theme-green .bg-neutral-800:hover, .theme-plain .bg-neutral-800:hover,
+.theme-green .bg-neutral-850:hover, .theme-plain .bg-neutral-850:hover {
+  background-color: var(--calc-btn-hover) !important;
+}
+
+.theme-green .bg-neutral-900\/20, .theme-plain .bg-neutral-900\/20 {
+  background-color: var(--bg-tertiary) !important;
+}
+
+/* 7. Hover triggers */
+.theme-green .hover\:border-\[\#C5A059\]\/40:hover, .theme-plain .hover\:border-\[\#C5A059\]\/40:hover {
+  border-color: var(--accent) !important;
+}
+.theme-green .group:hover .group-hover\:text-\[\#C5A059\], .theme-plain .group:hover .group-hover\:text-\[\#C5A059\] {
+  color: var(--accent) !important;
+}
+
+/* Custom Scrollbar Styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(197, 160, 89, 0.2);
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(197, 160, 89, 0.4);
+}
+
+.theme-green ::-webkit-scrollbar-thumb {
+  background: rgba(21, 128, 61, 0.2);
+}
+.theme-green ::-webkit-scrollbar-thumb:hover {
+  background: rgba(21, 128, 61, 0.4);
+}
+
+.theme-plain ::-webkit-scrollbar-thumb {
+  background: rgba(51, 65, 85, 0.2);
+}
+.theme-plain ::-webkit-scrollbar-thumb:hover {
+  background: rgba(51, 65, 85, 0.4);
+}
+
+body {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+  user-select: none;
+}

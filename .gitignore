@@ -1,0 +1,13 @@
+node_modules/
+.DS_Store
+.history/
+.lh/
+dist/
+dist-ssr/
+*.log
+*.local
+server/prisma/*.db
+server/prisma/*.db-journal
+server/.env
+client/.env
+.env
